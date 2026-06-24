@@ -523,7 +523,6 @@ with st.sidebar:
     api_ok = bool(config.GROQ_API_KEY)
     # TEMP DEBUG
     
-    st.markdown('<span class="sb-label">System Status</span>', unsafe_allow_html=True)
     if api_ok:
         st.markdown("""
         <div class="sb-card" style="padding: 0.65rem 1rem;">
@@ -551,7 +550,6 @@ with st.sidebar:
     st.markdown('<div style="height:0.5rem"></div>', unsafe_allow_html=True)
 
     # ── Configuration ──
-    st.markdown('<span class="sb-label">Configuration</span>', unsafe_allow_html=True)
     with st.container():
         st.markdown('<div class="sb-card">', unsafe_allow_html=True)
         categories = list(config.PROMPT_CATEGORIES.keys())
@@ -565,7 +563,6 @@ with st.sidebar:
     st.markdown('<div style="height:0.25rem"></div>', unsafe_allow_html=True)
 
     # ── Experiment Controls ──
-    st.markdown('<span class="sb-label">Experiment</span>', unsafe_allow_html=True)
     with st.container():
         st.markdown('<div class="sb-card">', unsafe_allow_html=True)
         force_rerun = st.checkbox("Force re-run (bypass cache)",
