@@ -1198,12 +1198,3 @@ with tabs[4]:
             st.markdown("<div style='height:1rem'></div>", unsafe_allow_html=True)
             st.plotly_chart(fig_cat, use_container_width=True)
 
-
-# ── Footer ────────────────────────────────────────────────────────────────────
-st.markdown("""
-<div style="text-align:center;color:#21262d;font-size:0.7rem;
-padding:1.5rem 0 0.5rem;border-top:1px solid #1c2128;margin-top:1rem;">
-  PSAF · Prompt Stability Analysis Framework ·
-  Groq calls only on ▶ Run · Cached in <code style="color:#30363d;">.psaf_cache/</code>
-</div>
-""", unsafe_allow_html=True)
