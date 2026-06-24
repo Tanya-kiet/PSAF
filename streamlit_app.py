@@ -521,6 +521,9 @@ with st.sidebar:
 
     # ── System Status ──
     api_ok = bool(config.GROQ_API_KEY)
+    # TEMP DEBUG
+    st.write("config.GROQ_API_KEY exists:", bool(config.GROQ_API_KEY))
+    st.write("Length:", len(config.GROQ_API_KEY) if config.GROQ_API_KEY else 0)
     st.markdown('<span class="sb-label">System Status</span>', unsafe_allow_html=True)
     if api_ok:
         st.markdown("""
