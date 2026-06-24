@@ -4,6 +4,11 @@ config.py — Central configuration for PSAF (Prompt Stability Analysis Framewor
 
 import os
 from pathlib import Path
+import os
+import streamlit as st
+
+st.write("GROQ env exists:", bool(os.getenv("GROQ_API_KEY")))
+st.write("Secrets available:", "GROQ_API_KEY" in st.secrets)
 
 # ── Project paths ─────────────────────────────────────────────────────────────
 BASE_DIR   = Path(__file__).parent.resolve()
