@@ -4,11 +4,6 @@ config.py — Central configuration for PSAF (Prompt Stability Analysis Framewor
 
 import os
 from pathlib import Path
-import os
-import streamlit as st
-
-st.write("GROQ env exists:", bool(os.getenv("GROQ_API_KEY")))
-st.write("Secrets available:", "GROQ_API_KEY" in st.secrets)
 
 # ── Project paths ─────────────────────────────────────────────────────────────
 BASE_DIR   = Path(__file__).parent.resolve()
@@ -19,7 +14,11 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 # NEVER hardcode your key. Set it in your shell:
 #   export GROQ_API_KEY="gsk_..."
 # Or in a .env file (add .env to .gitignore — NEVER commit it).
-GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
+try:
+    import streamlit as st
+    GROQ_API_KEY = st.secrets.get("GROQ_API_KEY", os.getenv("GROQ_API_KEY", ""))
+except Exception:
+    GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 
 # LLM settings
 LLM_MODEL          = "llama-3.1-8b-instant"
