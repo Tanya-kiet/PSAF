@@ -3,6 +3,7 @@
 .streamlit/secrets.toml
 .streamlit/
 
+
 # Cache
 .psaf_cache/
 
@@ -17,3 +18,5 @@ logs/
 
 # Mac
 .DS_Store
+.vscode/
+.idea/

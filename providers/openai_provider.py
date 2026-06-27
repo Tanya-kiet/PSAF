@@ -16,11 +16,18 @@ import logging
 import re
 import time
 
-import streamlit as st
-from openai import OpenAI
+import os
 
 import config
 from providers.base_provider import LLMProvider
+
+# Conditional import: openai is optional. If missing, OpenAIProvider.__init__
+# will raise a clear ImportError rather than a cryptic AttributeError later.
+try:
+    from openai import OpenAI as _OpenAI
+    _OPENAI_AVAILABLE = True
+except ImportError:
+    _OPENAI_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -53,20 +60,45 @@ _RESPONSE_SYSTEM = (
 _FALLBACK_RESPONSE = "[No response — OpenAI provider call failed]"
 
 
-def _openai_client() -> OpenAI:
-    """Return an authenticated OpenAI client using the Streamlit secret."""
-    try:
-        api_key = st.secrets["OPENAI_API_KEY"]
-    except Exception:
-        api_key = ""
+def _openai_client() -> "_OpenAI":
+    """
+    Return an authenticated OpenAI client.
+
+    Key resolution order (first non-empty wins):
+      1. OPENAI_API_KEY environment variable
+      2. st.secrets["OPENAI_API_KEY"] (when running inside Streamlit)
+
+    Raises EnvironmentError (NOT a silent fallback to Groq) if the key
+    is unavailable, so the caller knows OpenAI is genuinely misconfigured.
+    """
+    if not _OPENAI_AVAILABLE:
+        raise EnvironmentError(
+            "The 'openai' package is not installed. "
+            "Run: pip install openai"
+        )
+
+    # 1. Environment variable (works in all execution contexts)
+    api_key = os.getenv("OPENAI_API_KEY", "")
+
+    # 2. Streamlit secrets (only available when running inside Streamlit)
+    if not api_key:
+        try:
+            import streamlit as st
+            api_key = st.secrets.get("OPENAI_API_KEY", "")
+        except Exception:
+            pass
 
     if not api_key:
         raise EnvironmentError(
-            "OPENAI_API_KEY not found in st.secrets. "
-            "Add it to .streamlit/secrets.toml:\n"
-            '  OPENAI_API_KEY = "sk-..."'
+            "OPENAI_API_KEY not found.\n"
+            "Set it via environment variable:\n"
+            "  export OPENAI_API_KEY='sk-...'\n"
+            "Or add it to .streamlit/secrets.toml:\n"
+            '  OPENAI_API_KEY = "sk-..."\n'
+            "OpenAI provider cannot be used without a valid API key. "
+            "No fallback to Groq will occur."
         )
-    return OpenAI(api_key=api_key)
+    return _OpenAI(api_key=api_key)
 
 
 class OpenAIProvider(LLMProvider):
@@ -79,7 +111,8 @@ class OpenAIProvider(LLMProvider):
     """
 
     def __init__(self) -> None:
-        self._client: OpenAI = _openai_client()
+        # Raises EnvironmentError if key is missing — no silent Groq fallback
+        self._client = _openai_client()
 
     # ── public interface ──────────────────────────────────────────────────────
 
@@ -236,5 +269,10 @@ class OpenAIProvider(LLMProvider):
                 )
                 time.sleep(wait)
 
-        logger.error("OpenAI: all %d retries exhausted — returning empty string.", _MAX_RETRIES)
-        return ""
+        # Do NOT silently return empty string — raise so callers know OpenAI failed.
+        # This prevents the fallback pipeline from treating failed OpenAI calls
+        # as valid (identical-fallback) responses which produce misleading PSI scores.
+        raise RuntimeError(
+            f"OpenAI API: all {_MAX_RETRIES} retries exhausted. "
+            "Provider is genuinely unavailable — no silent fallback to Groq."
+        )

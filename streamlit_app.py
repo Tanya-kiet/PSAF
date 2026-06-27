@@ -24,6 +24,7 @@ import streamlit as st
 import config
 from backend import (
     QuestionResult,
+    FailedProviderResult,
     compute_category_stats,
     run_experiment,
     run_all_providers,
@@ -490,7 +491,7 @@ for k, v in {
     "last_run_time": None,
     "last_run_calls": 0,
     "running": False,
-    "provider_name": "groq",
+    "execution_mode": "fast",
 }.items():
     if k not in st.session_state:
         st.session_state[k] = v
@@ -528,8 +529,16 @@ with st.sidebar:
 
     # ── System Status ──
     api_ok = bool(config.GROQ_API_KEY)
-    # TEMP DEBUG
-    
+
+    # Detect OpenAI key via env var or st.secrets
+    import os as _os
+    _openai_key_ok = bool(_os.getenv("OPENAI_API_KEY", ""))
+    if not _openai_key_ok:
+        try:
+            _openai_key_ok = bool(st.secrets.get("OPENAI_API_KEY", ""))
+        except Exception:
+            pass
+
     if api_ok:
         st.markdown("""
         <div class="sb-card" style="padding: 0.65rem 1rem;">
@@ -552,25 +561,62 @@ with st.sidebar:
         </div>
         """, unsafe_allow_html=True)
 
+    # OpenAI key status — informs user whether Research Mode will work
+    if _openai_key_ok:
+        st.markdown("""
+        <div class="sb-card" style="padding: 0.65rem 1rem; margin-top: 0.25rem;">
+          <div class="status-badge status-ok">
+            <div class="status-dot dot-ok"></div>
+            OpenAI Connected
+          </div>
+          <div style="font-size:0.67rem;color:#484f58;margin-top:0.5rem;padding-left:0.25rem;">
+            Model: gpt-4o-mini &nbsp;·&nbsp; Research Mode ready
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        st.markdown("""
+        <div class="sb-card" style="padding: 0.65rem 1rem; margin-top: 0.25rem;">
+          <div class="status-badge status-err">
+            <div class="status-dot dot-err"></div>
+            OpenAI Key Missing
+          </div>
+          <div style="font-size:0.67rem;color:#484f58;margin-top:0.5rem;padding-left:0.25rem;">
+            Research Mode unavailable
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+
     st.markdown('<div style="height:0.5rem"></div>', unsafe_allow_html=True)
 
     # ── Configuration ──
     with st.container():
         st.markdown('<div class="sb-card">', unsafe_allow_html=True)
+        # ── Execution Mode ────────────────────────────────────────────────────
+        execution_mode = st.selectbox(
+            "Execution Mode",
+            options=["fast", "research"],
+            format_func=lambda x: {
+                "fast":     "⚡ Fast Mode (Groq only)",
+                "research": "🧠 Research Mode (Groq + OpenAI)",
+            }.get(x, x),
+            index=["fast", "research"].index(st.session_state["execution_mode"]),
+            help=(
+                "⚡ Fast Mode: Groq only — instant real-time PSI.\n"
+                "🧠 Research Mode: Groq + OpenAI — slower but enables "
+                "scientifically valid cross-provider PSI comparison."
+            ),
+        )
+        st.session_state["execution_mode"] = execution_mode
+
         categories = list(config.PROMPT_CATEGORIES.keys())
         selected_category = st.selectbox("Category", categories, label_visibility="visible")
         prompts = config.PROMPT_CATEGORIES[selected_category]
         selected_prompt = st.selectbox("Question", prompts, label_visibility="visible")
         n_variations = st.slider("Variations", 2, config.MAX_VARIATIONS, 3,
                                  help="Paraphrased versions to generate. More = more API calls.")
-        selected_provider = st.selectbox(
-            "Provider",
-            options=["groq", "openai", "all"],
-            format_func=lambda x: {"groq": "Groq (default)", "openai": "OpenAI (gpt-4o-mini)", "all": "All Models"}.get(x, x),
-            index=["groq", "openai", "all"].index(st.session_state["provider_name"]) if st.session_state["provider_name"] in ["groq", "openai", "all"] else 0,
-            help="LLM backend used to generate responses. 'All Models' runs every provider sequentially.",
-        )
-        st.session_state["provider_name"] = selected_provider
+        # Provider is determined INTERNALLY by Execution Mode — no user dropdown.
+        # fast → groq only | research → groq + openai (via run_all_providers)
         st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown('<div style="height:0.25rem"></div>', unsafe_allow_html=True)
@@ -668,17 +714,34 @@ if run_clicked:
         )
 
     t0 = time.time()
-    _provider_name = st.session_state["provider_name"]
 
-    if _provider_name == "all":
-        # ── All-models mode: run every registered provider sequentially ────────
-        multi_result = run_all_providers(
-            category=selected_category,
-            prompt=selected_prompt,
-            n_variations=n_variations,
-            force_rerun=force_rerun,
-            progress_cb=progress_cb,
-        )
+    # ── Execution Mode is the SOLE controller of provider selection ───────────
+    # fast     → Groq only (single provider, instant)
+    # research → Groq + OpenAI (multi-provider comparison via run_all_providers)
+    _execution_mode = st.session_state["execution_mode"]
+
+    if _execution_mode == "research":
+        # ── RESEARCH MODE: best-effort multi-model execution ──────────────────
+        # run_all_providers() only raises if EVERY provider fails.
+        # Partial success (e.g. Groq OK, OpenAI timeout) returns a
+        # MultiProviderResult with FailedProviderResult entries for failures.
+        try:
+            multi_result = run_all_providers(
+                category=selected_category,
+                prompt=selected_prompt,
+                n_variations=n_variations,
+                force_rerun=force_rerun,
+                progress_cb=progress_cb,
+                mode="research",
+            )
+        except Exception as _exc:
+            # Only reached when ALL providers failed simultaneously.
+            progress_bar.progress(0)
+            status_placeholder.error(
+                f"❌ All providers failed — no results available.\n\n{_exc}\n\n"
+                "Check both GROQ_API_KEY and OPENAI_API_KEY."
+            )
+            st.stop()
         elapsed = time.time() - t0
 
         for i in range(len(STAGES)):
@@ -689,34 +752,64 @@ if run_clicked:
 
         key = f"{selected_category}||{selected_prompt}"
         st.session_state.all_results[key] = multi_result
-        # Surface first provider's QuestionResult for existing single-result panels
-        first_provider = next(iter(multi_result.results))
-        st.session_state.result = multi_result.results[first_provider]
-        st.session_state.last_run_time = time.strftime("%H:%M:%S")
-        st.session_state.last_run_calls = (n_variations + 2) * len(multi_result.results)
 
-        psi_summary = "  |  ".join(
-            f"{p.upper()}: {r.psi_score:.1f}"
-            for p, r in multi_result.results.items()
-        )
+        # Surface first SUCCESSFUL provider's QuestionResult for single-result panels
+        first_provider = next(iter(multi_result.successful_results))
+        st.session_state.result = multi_result.successful_results[first_provider]
+        st.session_state.last_run_time = time.strftime("%H:%M:%S")
+        st.session_state.last_run_calls = (n_variations + 2) * len(multi_result.successful_results)
+
+        # Build status summary — show SUCCESS / FAILED per provider
+        success_parts = [
+            f"<span style='color:#3fb950;'>✓ {p.upper()}: {r.psi_score:.1f}</span>"
+            for p, r in multi_result.successful_results.items()
+        ]
+        failed_parts = [
+            f"<span style='color:#f85149;'>✗ {p.upper()}: failed</span>"
+            for p in multi_result.failed_results
+        ]
+        status_parts = "  &nbsp;|&nbsp;  ".join(success_parts + failed_parts)
+
+        # Show partial-success warning if any provider failed
+        any_failed = bool(multi_result.failed_results)
+        toast_bg    = "#1a2a1a" if not any_failed else "#1a1a00"
+        toast_border = "#238636" if not any_failed else "#856404"
+        toast_icon   = "✓" if not any_failed else "⚠"
+
         time.sleep(0.8)
         status_placeholder.markdown(f"""
-        <div class="success-toast">
-          ✓ &nbsp;All Models complete in {elapsed:.1f}s —
-          PSI: <strong style="font-family:'JetBrains Mono',monospace;">{psi_summary}</strong>
+        <div style="background:{toast_bg};border:1px solid {toast_border};
+        border-radius:10px;padding:0.75rem 1rem;font-size:0.85rem;">
+          <span style="color:{'#3fb950' if not any_failed else '#d29922'};">
+            {toast_icon} &nbsp;Research Mode complete in {elapsed:.1f}s
+          </span>
+          <br/><span style="font-family:'JetBrains Mono',monospace;font-size:0.8rem;">
+            {status_parts}
+          </span>
         </div>
         """, unsafe_allow_html=True)
 
     else:
-        # ── Single-provider mode: unchanged from Phase 4 ──────────────────────
-        result = run_experiment(
-            category=selected_category,
-            prompt=selected_prompt,
-            n_variations=n_variations,
-            force_rerun=force_rerun,
-            progress_cb=progress_cb,
-            provider_name=_provider_name,
-        )
+        # ── FAST MODE: Groq only — provider_name is always "groq" ────────────
+        # No user override possible. mode="fast" in run_experiment also enforces this.
+        try:
+            result = run_experiment(
+                category=selected_category,
+                prompt=selected_prompt,
+                n_variations=n_variations,
+                force_rerun=force_rerun,
+                progress_cb=progress_cb,
+                provider_name="groq",   # always groq in fast mode
+                mode="fast",
+            )
+        except Exception as _exc:
+            progress_bar.progress(0)
+            status_placeholder.error(
+                f"❌ Experiment failed: {_exc}\n\n"
+                "Check your GROQ_API_KEY. No silent fallback occurs — "
+                "errors surface here immediately."
+            )
+            st.stop()
         elapsed = time.time() - t0
 
         for i in range(len(STAGES)):
@@ -734,7 +827,7 @@ if run_clicked:
         time.sleep(0.8)
         status_placeholder.markdown(f"""
         <div class="success-toast">
-          ✓ &nbsp;Experiment complete in {elapsed:.1f}s —
+          ✓ &nbsp;Fast Mode complete in {elapsed:.1f}s —
           PSI Score: <strong style="font-family:'JetBrains Mono',monospace;">{result.psi_score:.1f}</strong>
         </div>
         """, unsafe_allow_html=True)
@@ -1178,19 +1271,36 @@ with tabs[4]:
         </div>
         """, unsafe_allow_html=True)
     else:
-        # Table
+        # Table — flatten MultiProviderResult → QuestionResult so both fast and
+        # research mode results are displayed correctly.
         rows = []
         for key, r in all_results.items():
-            rows.append({
-                "Category": r.category,
-                "Question": r.original_prompt[:55] + ("…" if len(r.original_prompt) > 55 else ""),
-                "PSI Score": round(r.psi_score, 1),
-                "Semantic": round(r.semantic_similarity, 3),
-                "Keyword": round(r.keyword_consistency, 3),
-                "Length": round(r.length_consistency, 3),
-                "Stability": psi_label(r.psi_score),
-                "Variations": len(r.variations) - 1,
-            })
+            if isinstance(r, MultiProviderResult):
+                # Research mode: show one row per provider
+                for prov, qr in r.successful_results.items():
+                    rows.append({
+                        "Category": qr.category,
+                        "Question": qr.original_prompt[:55] + ("…" if len(qr.original_prompt) > 55 else ""),
+                        "Provider": prov.capitalize(),
+                        "PSI Score": round(qr.psi_score, 1),
+                        "Semantic": round(qr.semantic_similarity, 3),
+                        "Keyword": round(qr.keyword_consistency, 3),
+                        "Length": round(qr.length_consistency, 3),
+                        "Stability": psi_label(qr.psi_score),
+                        "Variations": len(qr.variations) - 1,
+                    })
+            else:
+                rows.append({
+                    "Category": r.category,
+                    "Question": r.original_prompt[:55] + ("…" if len(r.original_prompt) > 55 else ""),
+                    "Provider": "Groq",
+                    "PSI Score": round(r.psi_score, 1),
+                    "Semantic": round(r.semantic_similarity, 3),
+                    "Keyword": round(r.keyword_consistency, 3),
+                    "Length": round(r.length_consistency, 3),
+                    "Stability": psi_label(r.psi_score),
+                    "Variations": len(r.variations) - 1,
+                })
         rows.sort(key=lambda x: x["PSI Score"], reverse=True)
 
         st.dataframe(
@@ -1207,9 +1317,16 @@ with tabs[4]:
             hide_index=True,
         )
 
-        # Category stats
-        all_result_list = list(all_results.values())
-        cat_stats = compute_category_stats(all_result_list)
+        # Category stats — flatten MultiProviderResult to QuestionResult list.
+        # compute_category_stats expects QuestionResult objects; passing
+        # MultiProviderResult (which has no .psi_score or .category) crashes.
+        _flat_for_stats: list[QuestionResult] = []
+        for _v in all_results.values():
+            if isinstance(_v, MultiProviderResult):
+                _flat_for_stats.extend(_v.successful_results.values())
+            else:
+                _flat_for_stats.append(_v)
+        cat_stats = compute_category_stats(_flat_for_stats)
 
         if len(cat_stats) >= 2:
             st.markdown("<div style='height:1rem'></div>", unsafe_allow_html=True)
@@ -1272,6 +1389,23 @@ with tabs[5]:
                 out.append(v)
         return out
 
+    def _avg_response_words(res) -> float:
+        """Safely compute average response-word count from a QuestionResult.
+        VariationResult has .variation (prompt text) and .response (LLM reply).
+        Falls back gracefully for plain strings (backward-compatible).
+        """
+        if not res.variations:
+            return 0.0
+        def _words(v) -> int:
+            if isinstance(v, str):
+                return len(v.split())
+            if hasattr(v, "response"):
+                return len(v.response.split())
+            if hasattr(v, "variation"):
+                return len(v.variation.split())
+            return len(str(v).split())
+        return sum(_words(v) for v in res.variations) / len(res.variations)
+
     multi_runs = _get_multi_results()
 
     # ── Empty state ──────────────────────────────────────────────────────────
@@ -1283,9 +1417,9 @@ with tabs[5]:
             No comparison data yet
           </div>
           <div style="font-size:0.82rem;color:#484f58;max-width:360px;margin:0 auto;">
-            Select <strong style="color:#cdd9e5;">All Models</strong> from the Provider
-            dropdown in the sidebar and click <strong style="color:#cdd9e5;">▶ Run Experiment</strong>
-            to generate multi-provider results.
+            Switch to <strong style="color:#cdd9e5;">🧠 Research Mode</strong> in the sidebar
+            and click <strong style="color:#cdd9e5;">▶ Run Experiment</strong>
+            to generate multi-provider PSI comparison results.
           </div>
         </div>
         """, unsafe_allow_html=True)
@@ -1329,7 +1463,7 @@ with tabs[5]:
 
         # ── Build ranked list ─────────────────────────────────────────────────
         ranked = sorted(
-            active.results.items(),
+            active.successful_results.items(),
             key=lambda kv: kv[1].psi_score,
             reverse=True,
         )
@@ -1343,6 +1477,22 @@ with tabs[5]:
 
         def _medal(rank: int) -> str:
             return ["🥇", "🥈", "🥉"][rank] if rank < 3 else f"#{rank+1}"
+
+        # ── Show failed provider alerts (partial-success mode) ────────────────
+        failed_providers = active.failed_results
+        if failed_providers:
+            for fp_name, fp in failed_providers.items():
+                st.markdown(f"""
+                <div style="background:#2d0f0f;border:1px solid #b91c1c;border-radius:10px;
+                            padding:0.75rem 1rem;margin-bottom:0.5rem;font-size:0.83rem;">
+                  <span style="color:#f85149;font-weight:600;">
+                    ✗ {fp_name.upper()} — Provider failed (partial results shown)
+                  </span><br/>
+                  <span style="color:#8b949e;font-size:0.75rem;font-family:'JetBrains Mono',monospace;">
+                    {fp.error}
+                  </span>
+                </div>
+                """, unsafe_allow_html=True)
 
         # ── Medal ranking row ─────────────────────────────────────────────────
         st.markdown('<span class="section-label">Provider Ranking</span>', unsafe_allow_html=True)
@@ -1370,7 +1520,7 @@ with tabs[5]:
         table_rows = []
         for idx, (prov, res) in enumerate(ranked):
             avg_words = (
-                sum(len(v.split()) for v in res.variations) / len(res.variations)
+                _avg_response_words(res)
                 if res.variations else 0
             )
             table_rows.append({
@@ -1439,7 +1589,7 @@ with tabs[5]:
             avg_words_list = []
             for _, res in ranked:
                 avg_words_list.append(
-                    sum(len(v.split()) for v in res.variations) / len(res.variations)
+                    _avg_response_words(res)
                     if res.variations else 0
                 )
             fig_words = go.Figure(go.Bar(
@@ -1505,7 +1655,7 @@ with tabs[5]:
             st.markdown('<span class="section-label">All Compared Prompts</span>', unsafe_allow_html=True)
             hist_rows = []
             for mr in multi_runs:
-                mr_ranked = sorted(mr.results.items(), key=lambda kv: kv[1].psi_score, reverse=True)
+                mr_ranked = sorted(mr.successful_results.items(), key=lambda kv: kv[1].psi_score, reverse=True)
                 best_prov, best_res = mr_ranked[0]
                 hist_rows.append({
                     "Prompt":     mr.prompt[:60] + ("…" if len(mr.prompt) > 60 else ""),
@@ -1531,10 +1681,10 @@ with tabs[5]:
             writer.writerow(["Rank", "Provider", "PSI Score", "Semantic Similarity",
                              "Keyword Consistency", "Length Consistency",
                              "Avg Response Words", "Stability", "Prompt", "Category"])
-            _ranked = sorted(mr.results.items(), key=lambda kv: kv[1].psi_score, reverse=True)
+            _ranked = sorted(mr.successful_results.items(), key=lambda kv: kv[1].psi_score, reverse=True)
             for rank_idx, (prov, res) in enumerate(_ranked):
                 avg_w = (
-                    sum(len(v.split()) for v in res.variations) / len(res.variations)
+                    _avg_response_words(res)
                     if res.variations else 0
                 )
                 writer.writerow([
@@ -1553,7 +1703,7 @@ with tabs[5]:
 
         # 2. JSON — full structured results
         def _build_json(mr: MultiProviderResult) -> str:
-            _ranked = sorted(mr.results.items(), key=lambda kv: kv[1].psi_score, reverse=True)
+            _ranked = sorted(mr.successful_results.items(), key=lambda kv: kv[1].psi_score, reverse=True)
             payload = {
                 "prompt":    mr.prompt,
                 "category":  mr.category,
@@ -1567,11 +1717,11 @@ with tabs[5]:
                         "stability":            _stability_label(res.psi_score),
                         "num_variations":       len(res.variations),
                         "response_length_avg_words": round(
-                            sum(len(v.split()) for v in res.variations) / len(res.variations)
+                            _avg_response_words(res)
                             if res.variations else 0, 1
                         ),
                     }
-                    for prov, res in mr.results.items()
+                    for prov, res in mr.successful_results.items()
                 },
                 "ranking": [
                     {"rank": i + 1, "provider": prov, "psi_score": round(res.psi_score, 4)}
@@ -1582,7 +1732,7 @@ with tabs[5]:
 
         # 3. TXT — human-readable ranking report
         def _build_txt(mr: MultiProviderResult) -> str:
-            _ranked = sorted(mr.results.items(), key=lambda kv: kv[1].psi_score, reverse=True)
+            _ranked = sorted(mr.successful_results.items(), key=lambda kv: kv[1].psi_score, reverse=True)
             lines = [
                 "=" * 52,
                 "  PSAF Comparison Report",

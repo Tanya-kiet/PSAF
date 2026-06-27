@@ -75,6 +75,18 @@ class ExperimentResult:
     total_time_s: float
 
 
+@dataclass
+class FailedProviderResult:
+    """
+    Sentinel returned by run_all_providers() for a provider that raised an
+    exception.  Lets the rest of the pipeline continue and the UI to show a
+    per-provider error without aborting the whole experiment.
+    """
+    provider_name: str
+    error: str          # human-readable error message
+    psi_score: float = 0.0   # sentinel — never used for real PSI computation
+
+
 # ── Groq helpers ──────────────────────────────────────────────────────────────
 
 def _groq_client() -> Groq:
@@ -255,9 +267,23 @@ def compute_psi(responses: list[str]) -> tuple[float, float, float, float, list[
 
 # ── Cache helpers ─────────────────────────────────────────────────────────────
 
+# Map provider name → actual model string so cache keys are fully unambiguous.
+# Using config.LLM_MODEL for every provider was wrong: it is the Groq model name
+# (llama-3.1-8b-instant) and would produce the same model-component in the key
+# for both Groq and OpenAI, relying SOLELY on provider_name for differentiation.
+# Adding the real model name makes each cache entry self-documenting and safe
+# even if provider_name handling ever changes.
+_PROVIDER_MODEL_MAP: dict[str, str] = {
+    "groq":   config.LLM_MODEL,   # llama-3.1-8b-instant
+    "openai": "gpt-4o-mini",
+}
+
+
 def _cache_key(category: str, prompt: str, n_variations: int, provider_name: str = "groq") -> str:
-    # Include provider_name so Groq and OpenAI results never share a cache entry
-    raw = f"{category}|{prompt}|{n_variations}|{config.LLM_MODEL}|{provider_name}"
+    # Use the ACTUAL model name for each provider, not the global LLM_MODEL,
+    # so Groq and OpenAI cache entries are distinguished by both model AND provider.
+    model_name = _PROVIDER_MODEL_MAP.get(provider_name, f"unknown-{provider_name}")
+    raw = f"{category}|{prompt}|{n_variations}|{model_name}|{provider_name}"
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
@@ -303,6 +329,7 @@ def run_experiment(
     force_rerun: bool = False,
     progress_cb: Optional[Callable[[str], None]] = None,
     provider_name: str = "groq",
+    mode: str = "fast",
 ) -> QuestionResult:
     """
     Run a single question experiment using the specified LLM provider.
@@ -319,7 +346,16 @@ def run_experiment(
         provider_name: LLM backend to use — "groq" (default) or "openai".
                        Defaults to "groq" so all existing call-sites that
                        omit this argument behave exactly as before.
+        mode:          Execution mode — "fast" (Groq-only, default) or
+                       "research" (Groq + OpenAI, returns first provider's
+                       result; use run_all_providers() for full comparison).
+                       In "fast" mode, provider_name is forced to "groq"
+                       regardless of the value passed in.
     """
+    # ── Mode gate: Fast mode is always Groq-only ──────────────────────────────
+    if mode == "fast":
+        provider_name = "groq"  # enforce: no OpenAI calls in fast mode
+    # research mode uses whatever provider_name was passed (or groq by default)
     def emit(msg: str):
         if progress_cb:
             progress_cb(msg)
@@ -341,7 +377,15 @@ def run_experiment(
     llm_calls = 0
 
     emit(f"🔀 Generating {n_variations} variations…")
-    variations = provider.generate_variations(prompt)[:n_variations]
+    try:
+        variations = provider.generate_variations(prompt)[:n_variations]
+    except Exception as exc:
+        logger.error(
+            "run_experiment[%s]: generate_variations raised %s: %s — "
+            "using seed prompt copies as fallback variations.",
+            provider_name, type(exc).__name__, exc,
+        )
+        variations = []
     # Pad to requested count if provider returned fewer
     if len(variations) < n_variations:
         variations += [prompt] * (n_variations - len(variations))
@@ -367,7 +411,25 @@ def run_experiment(
 
     for i, var in enumerate(all_prompts):
         emit(f"🤖 Getting LLM response {i + 1}/{len(all_prompts)}…")
-        resp = provider.generate_response(var)
+        try:
+            resp = provider.generate_response(var)
+        except Exception as exc:
+            # Log per-response failure but DO NOT raise — one bad response
+            # should not abort the entire provider run.  Use the fallback
+            # token so compute_psi() still receives a valid (non-empty) string.
+            # This is intentional: a single timeout/rate-limit shouldn't kill
+            # the whole experiment; PSI will naturally reflect the degraded data.
+            logger.error(
+                "run_experiment[%s]: provider.generate_response raised %s: %s — "
+                "using fallback response for prompt[%d].",
+                provider_name, type(exc).__name__, exc, i,
+            )
+            resp = _FALLBACK_RESPONSE
+
+        # ── Debug print: verify WHICH provider returned WHAT ─────────────────
+        print(f"[DEBUG] PROVIDER: {provider_name!r}  |  prompt[{i}]: {var[:60]!r}")
+        print(f"[DEBUG] RESPONSE[:200]: {resp[:200]!r}")
+
         # Safety: never let an empty string into the PSI pipeline
         if not resp.strip():
             logger.warning(
@@ -414,6 +476,7 @@ def run_category_experiment(
     force_rerun: bool = False,
     progress_cb: Optional[Callable[[str], None]] = None,
     provider_name: str = "groq",
+    mode: str = "fast",
 ) -> list[QuestionResult]:
     """
     Run all questions in a category using the specified LLM provider.
@@ -424,6 +487,8 @@ def run_category_experiment(
         force_rerun:   Bypass cache when True.
         progress_cb:   Optional progress callback.
         provider_name: LLM backend — "groq" (default) or "openai".
+        mode:          Execution mode — "fast" (Groq-only) or "research"
+                       (Groq + OpenAI).
     """
     prompts = config.PROMPT_CATEGORIES.get(category, [])
     results = []
@@ -431,7 +496,7 @@ def run_category_experiment(
         if progress_cb:
             progress_cb(f"Question {i+1}/{len(prompts)}: {prompt[:50]}…")
         result = run_experiment(
-            category, prompt, n_variations, force_rerun, progress_cb, provider_name
+            category, prompt, n_variations, force_rerun, progress_cb, provider_name, mode
         )
         results.append(result)
     return results
@@ -465,30 +530,37 @@ def compute_category_stats(results: list[QuestionResult]) -> dict[str, dict]:
 @dataclass
 class MultiProviderResult:
     """
-    Holds the outcome of an "all models" run for a single prompt.
+    Holds the outcome of a Research Mode run for a single prompt.
 
-    Structure mirrors the requirement:
-        {
-          "prompt": "...",
-          "results": {
-            "groq":   QuestionResult,
-            "openai": QuestionResult,
-          }
-        }
+    `results` maps provider_name → QuestionResult (success) OR
+    FailedProviderResult (failure).  The UI inspects isinstance() to decide
+    how to render each provider slot.
 
-    Single-provider QuestionResult objects are stored verbatim under
-    their provider key — no PSI values are merged or averaged.
+    At least one entry in `results` is always a QuestionResult
+    (run_all_providers raises RuntimeError if every provider fails).
     """
     prompt: str
     category: str
-    results: dict[str, QuestionResult]   # provider_name → QuestionResult
+    results: dict  # provider_name → QuestionResult | FailedProviderResult
+
+    @property
+    def successful_results(self) -> dict:
+        """Only the providers that succeeded."""
+        return {k: v for k, v in self.results.items() if isinstance(v, QuestionResult)}
+
+    @property
+    def failed_results(self) -> dict:
+        """Only the providers that failed."""
+        return {k: v for k, v in self.results.items() if isinstance(v, FailedProviderResult)}
 
     def to_dict(self) -> dict:
-        return {
-            "prompt": self.prompt,
-            "category": self.category,
-            "results": {k: asdict(v) for k, v in self.results.items()},
-        }
+        out: dict = {"prompt": self.prompt, "category": self.category, "results": {}}
+        for k, v in self.results.items():
+            if isinstance(v, QuestionResult):
+                out["results"][k] = asdict(v)
+            else:
+                out["results"][k] = {"status": "failed", "error": v.error}
+        return out
 
 
 # ── All-providers experiment runner ──────────────────────────────────────────
@@ -499,9 +571,10 @@ def run_all_providers(
     n_variations: int = config.MAX_VARIATIONS,
     force_rerun: bool = False,
     progress_cb: Optional[Callable[[str], None]] = None,
+    mode: str = "research",
 ) -> MultiProviderResult:
     """
-    Run the same experiment sequentially across every registered provider.
+    Run the same experiment sequentially across providers selected by mode.
 
     Each provider gets its own independent call to run_experiment(), so:
       • PSI is computed separately per provider (never merged).
@@ -514,37 +587,109 @@ def run_all_providers(
         n_variations: Paraphrase count (passed through to each provider).
         force_rerun:  Bypass cache for all providers when True.
         progress_cb:  Optional progress callback (prefixed with provider name).
+        mode:         Execution mode.
+                      "fast"     → Groq only (instant, no OpenAI calls).
+                      "research" → Groq + OpenAI (scientifically valid
+                                   cross-provider PSI comparison).
 
     Returns:
         MultiProviderResult containing one QuestionResult per provider.
+        PSI scores are computed independently per provider — never merged.
+        Example structure:
+            {
+              "groq":   QuestionResult(psi_score=0.87, ...),
+              "openai": QuestionResult(psi_score=0.81, ...),
+            }
     """
-    from providers import PROVIDER_REGISTRY   # import here to avoid circular at module load
+    # ── Mode-controlled provider selection ───────────────────────────────────
+    # FAST MODE:     Groq only — no OpenAI calls, maximum speed.
+    # RESEARCH MODE: Groq + OpenAI — independent PSI per provider for
+    #                scientifically valid comparison dashboard.
+    if mode == "fast":
+        ordered = ["groq"]
+    else:  # "research"
+        ordered = ["groq", "openai"]
 
-    # Groq-first ordering: run the fast baseline provider before slower ones
-    # (e.g. Gemini) so the UI receives early feedback quickly.
-    ordered = ["groq"] + [p for p in PROVIDER_REGISTRY if p != "groq"]
-
-    provider_results: dict[str, QuestionResult] = {}
+    # provider_name -> QuestionResult (success) or FailedProviderResult (failure)
+    provider_results: dict = {}
+    provider_errors:  dict[str, str] = {}
 
     for provider_name in ordered:
         def _scoped_cb(msg: str, pname: str = provider_name) -> None:
             if progress_cb:
                 progress_cb(f"[{pname.upper()}] {msg}")
 
-        logger.info("run_all_providers — starting provider: %s", provider_name)
-        qr = run_experiment(
-            category=category,
-            prompt=prompt,
-            n_variations=n_variations,
-            force_rerun=force_rerun,
-            progress_cb=_scoped_cb,
-            provider_name=provider_name,
+        logger.info("run_all_providers — starting provider: %s (mode=%s)", provider_name, mode)
+        try:
+            qr = run_experiment(
+                category=category,
+                prompt=prompt,
+                n_variations=n_variations,
+                force_rerun=force_rerun,
+                progress_cb=_scoped_cb,
+                provider_name=provider_name,
+                mode=mode,
+            )
+            provider_results[provider_name] = qr
+            logger.info(
+                "run_all_providers — %s complete | PSI=%.2f",
+                provider_name, qr.psi_score,
+            )
+        except Exception as exc:
+            # Provider failed — record it but NEVER abort other providers.
+            # This is the core "best-effort multi-model" contract:
+            # one failure must not prevent partial results from the rest.
+            err_msg = f"{type(exc).__name__}: {exc}"
+            logger.error(
+                "run_all_providers — %s FAILED: %s — continuing with remaining providers.",
+                provider_name, err_msg,
+            )
+            provider_errors[provider_name] = err_msg
+            provider_results[provider_name] = FailedProviderResult(
+                provider_name=provider_name,
+                error=err_msg,
+            )
+            if progress_cb:
+                progress_cb(f"[{provider_name.upper()}] ❌ Provider failed: {err_msg}")
+            # Continue loop — do NOT raise, do NOT break
+
+    # ── Abort only if ALL providers failed (nothing to show the user) ─────────
+    successful = [
+        pname for pname, r in provider_results.items()
+        if isinstance(r, QuestionResult)
+    ]
+    if not successful:
+        all_errors = "; ".join(f"{p}: {e}" for p, e in provider_errors.items())
+        raise RuntimeError(
+            f"All providers failed — no results available. Errors: {all_errors}"
         )
-        provider_results[provider_name] = qr
-        logger.info(
-            "run_all_providers — %s complete | PSI=%.2f",
-            provider_name, qr.psi_score,
-        )
+
+    # ── Cross-provider divergence check (non-fatal, log-only) ─────────────────────
+    # No assert — divergence logging must never kill a partial-success run.
+    groq_qr   = provider_results.get("groq")
+    openai_qr = provider_results.get("openai")
+    if isinstance(groq_qr, QuestionResult) and isinstance(openai_qr, QuestionResult):
+        gvars = groq_qr.variations
+        ovars = openai_qr.variations
+        if gvars and ovars:
+            gr  = gvars[0].response
+            or_ = ovars[0].response
+            _is_fallback = lambda r: r.startswith("[No response")
+            if not _is_fallback(gr) and not _is_fallback(or_):
+                if gr == or_:
+                    logger.error(
+                        "run_all_providers: Groq and OpenAI returned IDENTICAL responses — "
+                        "one provider may be secretly calling the other's API. "
+                        "(Non-fatal — results still stored.)"
+                    )
+                else:
+                    logger.info(
+                        "run_all_providers: response divergence confirmed ✓ "
+                        "GROQ[:80]=%r  OPENAI[:80]=%r", gr[:80], or_[:80],
+                    )
+                    print("[DEBUG] PSI divergence check:")
+                    print(f"  GROQ   PSI = {groq_qr.psi_score:.2f}")
+                    print(f"  OPENAI PSI = {openai_qr.psi_score:.2f}")
 
     return MultiProviderResult(
         prompt=prompt,

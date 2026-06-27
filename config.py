@@ -16,6 +16,14 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 # Or in a .env file (add .env to .gitignore — NEVER commit it).
 GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
 
+# ── OpenAI API ────────────────────────────────────────────────────────────────
+# Required for Research Mode (Groq + OpenAI comparison).
+# Resolution order: env var → st.secrets["OPENAI_API_KEY"]
+# The OpenAIProvider reads this directly; config exposes it for status checks.
+#   export OPENAI_API_KEY="sk-..."
+# Or add to .streamlit/secrets.toml (see secrets.toml.example)
+OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
+
 # LLM settings
 LLM_MODEL          = "llama-3.1-8b-instant"
 MAX_TOKENS: int    = 512      # kept short to reduce latency
