@@ -21,8 +21,7 @@ from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
 from sklearn.metrics.pairwise import cosine_similarity
 
 import config
-
-# ── Logging ────────────────────────────────────────────────────────────────
+from providers import get_provider
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(name)s — %(message)s",
@@ -64,7 +63,8 @@ import time
 
 class GroqClient:
     def __init__(self):
-        self.client = Groq(api_key=config.GROQ_API_KEY)
+        self._provider = get_provider()
+        self.client = self._provider._client
 
     def generate(self, messages, temperature=0.7, max_retries=5):
         for attempt in range(max_retries):

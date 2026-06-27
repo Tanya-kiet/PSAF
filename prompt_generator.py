@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from groq import Groq
 
 import config
+from providers import get_provider
 
 logger = logging.getLogger(__name__)
 

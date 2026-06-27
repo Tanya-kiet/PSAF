@@ -11,7 +11,11 @@ Architecture:
 
 from __future__ import annotations
 
+import csv
+import io
+import json
 import time
+from datetime import datetime
 
 import numpy as np
 import plotly.graph_objects as go
@@ -22,6 +26,8 @@ from backend import (
     QuestionResult,
     compute_category_stats,
     run_experiment,
+    run_all_providers,
+    MultiProviderResult,
 )
 
 # ── Page config ───────────────────────────────────────────────────────────────
@@ -484,6 +490,7 @@ for k, v in {
     "last_run_time": None,
     "last_run_calls": 0,
     "running": False,
+    "provider_name": "groq",
 }.items():
     if k not in st.session_state:
         st.session_state[k] = v
@@ -556,6 +563,14 @@ with st.sidebar:
         selected_prompt = st.selectbox("Question", prompts, label_visibility="visible")
         n_variations = st.slider("Variations", 2, config.MAX_VARIATIONS, 3,
                                  help="Paraphrased versions to generate. More = more API calls.")
+        selected_provider = st.selectbox(
+            "Provider",
+            options=["groq", "openai", "all"],
+            format_func=lambda x: {"groq": "Groq (default)", "openai": "OpenAI (gpt-4o-mini)", "all": "All Models"}.get(x, x),
+            index=["groq", "openai", "all"].index(st.session_state["provider_name"]) if st.session_state["provider_name"] in ["groq", "openai", "all"] else 0,
+            help="LLM backend used to generate responses. 'All Models' runs every provider sequentially.",
+        )
+        st.session_state["provider_name"] = selected_provider
         st.markdown('</div>', unsafe_allow_html=True)
 
     st.markdown('<div style="height:0.25rem"></div>', unsafe_allow_html=True)
@@ -653,35 +668,77 @@ if run_clicked:
         )
 
     t0 = time.time()
-    result = run_experiment(
-        category=selected_category,
-        prompt=selected_prompt,
-        n_variations=n_variations,
-        force_rerun=force_rerun,
-        progress_cb=progress_cb,
-    )
-    elapsed = time.time() - t0
+    _provider_name = st.session_state["provider_name"]
 
-    for i in range(len(STAGES)):
-        stage_states[i] = "done"
-    stage_html_placeholder.markdown(render_stages(), unsafe_allow_html=True)
-    progress_bar.progress(100)
-    log_placeholder.empty()
+    if _provider_name == "all":
+        # ── All-models mode: run every registered provider sequentially ────────
+        multi_result = run_all_providers(
+            category=selected_category,
+            prompt=selected_prompt,
+            n_variations=n_variations,
+            force_rerun=force_rerun,
+            progress_cb=progress_cb,
+        )
+        elapsed = time.time() - t0
 
-    # Store
-    key = f"{selected_category}||{selected_prompt}"
-    st.session_state.all_results[key] = result
-    st.session_state.result = result
-    st.session_state.last_run_time = time.strftime("%H:%M:%S")
-    st.session_state.last_run_calls = n_variations + 2
+        for i in range(len(STAGES)):
+            stage_states[i] = "done"
+        stage_html_placeholder.markdown(render_stages(), unsafe_allow_html=True)
+        progress_bar.progress(100)
+        log_placeholder.empty()
 
-    time.sleep(0.8)
-    status_placeholder.markdown(f"""
-    <div class="success-toast">
-      ✓ &nbsp;Experiment complete in {elapsed:.1f}s —
-      PSI Score: <strong style="font-family:'JetBrains Mono',monospace;">{result.psi_score:.1f}</strong>
-    </div>
-    """, unsafe_allow_html=True)
+        key = f"{selected_category}||{selected_prompt}"
+        st.session_state.all_results[key] = multi_result
+        # Surface first provider's QuestionResult for existing single-result panels
+        first_provider = next(iter(multi_result.results))
+        st.session_state.result = multi_result.results[first_provider]
+        st.session_state.last_run_time = time.strftime("%H:%M:%S")
+        st.session_state.last_run_calls = (n_variations + 2) * len(multi_result.results)
+
+        psi_summary = "  |  ".join(
+            f"{p.upper()}: {r.psi_score:.1f}"
+            for p, r in multi_result.results.items()
+        )
+        time.sleep(0.8)
+        status_placeholder.markdown(f"""
+        <div class="success-toast">
+          ✓ &nbsp;All Models complete in {elapsed:.1f}s —
+          PSI: <strong style="font-family:'JetBrains Mono',monospace;">{psi_summary}</strong>
+        </div>
+        """, unsafe_allow_html=True)
+
+    else:
+        # ── Single-provider mode: unchanged from Phase 4 ──────────────────────
+        result = run_experiment(
+            category=selected_category,
+            prompt=selected_prompt,
+            n_variations=n_variations,
+            force_rerun=force_rerun,
+            progress_cb=progress_cb,
+            provider_name=_provider_name,
+        )
+        elapsed = time.time() - t0
+
+        for i in range(len(STAGES)):
+            stage_states[i] = "done"
+        stage_html_placeholder.markdown(render_stages(), unsafe_allow_html=True)
+        progress_bar.progress(100)
+        log_placeholder.empty()
+
+        key = f"{selected_category}||{selected_prompt}"
+        st.session_state.all_results[key] = result
+        st.session_state.result = result
+        st.session_state.last_run_time = time.strftime("%H:%M:%S")
+        st.session_state.last_run_calls = n_variations + 2
+
+        time.sleep(0.8)
+        status_placeholder.markdown(f"""
+        <div class="success-toast">
+          ✓ &nbsp;Experiment complete in {elapsed:.1f}s —
+          PSI Score: <strong style="font-family:'JetBrains Mono',monospace;">{result.psi_score:.1f}</strong>
+        </div>
+        """, unsafe_allow_html=True)
+
     time.sleep(1.2)
     st.rerun()
 
@@ -771,6 +828,7 @@ tabs = st.tabs([
     "📊  Similarity Analysis",
     "🎯  PSI Breakdown",
     "📋  Category Comparison",
+    "🔬  Comparison Dashboard",
 ])
 
 
@@ -937,13 +995,21 @@ with tabs[2]:
             )
             st.plotly_chart(fig_bar, use_container_width=True)
 
-    # Mean similarity metric
+    # Mean similarity metric — guarded against empty upper-triangle (single-response / partial data)
     idx_upper = np.triu_indices_from(mat, k=1)
-    mean_sim = float(np.mean(mat[idx_upper]))
+    vals = mat[idx_upper]
+    if vals.size == 0:
+        mean_sim = 0.0
+        min_sim  = 0.0
+        max_sim  = 0.0
+    else:
+        mean_sim = float(np.mean(vals))
+        min_sim  = float(np.min(vals))
+        max_sim  = float(np.max(vals))
     m1, m2, m3 = st.columns(3)
     m1.metric("Mean Pairwise Similarity", f"{mean_sim:.3f}")
-    m2.metric("Min Pairwise Similarity", f"{float(np.min(mat[idx_upper])):.3f}")
-    m3.metric("Max Pairwise Similarity", f"{float(np.max(mat[idx_upper])):.3f}")
+    m2.metric("Min Pairwise Similarity",  f"{min_sim:.3f}")
+    m3.metric("Max Pairwise Similarity",  f"{max_sim:.3f}")
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -1191,3 +1257,404 @@ with tabs[4]:
             )
             st.markdown("<div style='height:1rem'></div>", unsafe_allow_html=True)
             st.plotly_chart(fig_cat, use_container_width=True)
+
+# ───────────────────────────────────────────────────────────────────────────
+# TAB 6 — Comparison Dashboard (Phase 6) + Export System (Phase 7)
+# ───────────────────────────────────────────────────────────────────────────
+with tabs[5]:
+
+    # ── Helper: collect all MultiProviderResult entries from session ─────────
+    def _get_multi_results() -> list[MultiProviderResult]:
+        """Return all MultiProviderResult objects stored in session_state.all_results."""
+        out = []
+        for v in st.session_state.all_results.values():
+            if isinstance(v, MultiProviderResult):
+                out.append(v)
+        return out
+
+    multi_runs = _get_multi_results()
+
+    # ── Empty state ──────────────────────────────────────────────────────────
+    if not multi_runs:
+        st.markdown("""
+        <div style="text-align:center;padding:4rem 2rem;color:#484f58;">
+          <div style="font-size:2.5rem;margin-bottom:0.75rem;">🔬</div>
+          <div style="font-size:1rem;font-weight:600;color:#8b949e;margin-bottom:0.5rem;">
+            No comparison data yet
+          </div>
+          <div style="font-size:0.82rem;color:#484f58;max-width:360px;margin:0 auto;">
+            Select <strong style="color:#cdd9e5;">All Models</strong> from the Provider
+            dropdown in the sidebar and click <strong style="color:#cdd9e5;">▶ Run Experiment</strong>
+            to generate multi-provider results.
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # ── Graceful disabled export buttons ────────────────────────────────
+        st.markdown("---")
+        st.markdown('<span class="section-label">Export Results</span>', unsafe_allow_html=True)
+        st.info("No data available for export — run an All Models experiment first.")
+        exp_cols = st.columns(3)
+        with exp_cols[0]:
+            st.download_button("⬇  Download CSV", data="", file_name="psaf_comparison.csv",
+                               mime="text/csv", disabled=True, use_container_width=True)
+        with exp_cols[1]:
+            st.download_button("⬇  Download JSON", data="", file_name="psaf_comparison.json",
+                               mime="application/json", disabled=True, use_container_width=True)
+        with exp_cols[2]:
+            st.download_button("⬇  Download Report (TXT)", data="",
+                               file_name="psaf_report.txt", mime="text/plain",
+                               disabled=True, use_container_width=True)
+
+    else:
+        # Use the most-recent multi run as the "active" comparison
+        active = multi_runs[-1]
+
+        # ── Prompt header ────────────────────────────────────────────────────
+        st.markdown(f"""
+        <div style="background:#161b22;border:1px solid #21262d;border-radius:12px;
+                    padding:1rem 1.25rem;margin-bottom:1rem;">
+          <div style="font-size:0.65rem;font-weight:700;letter-spacing:.1em;
+                      text-transform:uppercase;color:#484f58;margin-bottom:0.35rem;">
+            Compared Prompt
+          </div>
+          <div style="font-size:0.92rem;color:#e6edf3;font-weight:500;">
+            {active.prompt}
+          </div>
+          <div style="font-size:0.72rem;color:#484f58;margin-top:0.35rem;">
+            Category: {active.category}
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # ── Build ranked list ─────────────────────────────────────────────────
+        ranked = sorted(
+            active.results.items(),
+            key=lambda kv: kv[1].psi_score,
+            reverse=True,
+        )
+
+        def _stability_label(score: float) -> str:
+            if score >= 75:
+                return "Highly Stable"
+            if score >= 50:
+                return "Moderately Stable"
+            return "Unstable"
+
+        def _medal(rank: int) -> str:
+            return ["🥇", "🥈", "🥉"][rank] if rank < 3 else f"#{rank+1}"
+
+        # ── Medal ranking row ─────────────────────────────────────────────────
+        st.markdown('<span class="section-label">Provider Ranking</span>', unsafe_allow_html=True)
+        medal_cols = st.columns(len(ranked))
+        for idx, (prov, res) in enumerate(ranked):
+            with medal_cols[idx]:
+                stability = _stability_label(res.psi_score)
+                color = "#3fb950" if res.psi_score >= 75 else ("#d29922" if res.psi_score >= 50 else "#f85149")
+                st.markdown(f"""
+                <div style="background:#161b22;border:1px solid #21262d;border-radius:12px;
+                            padding:1.1rem;text-align:center;">
+                  <div style="font-size:2rem;margin-bottom:0.4rem;">{_medal(idx)}</div>
+                  <div style="font-size:0.85rem;font-weight:600;color:#e6edf3;
+                              text-transform:capitalize;">{prov}</div>
+                  <div style="font-size:1.4rem;font-weight:700;font-family:'JetBrains Mono',monospace;
+                              color:{color};margin:0.4rem 0;">{res.psi_score:.1f}</div>
+                  <div style="font-size:0.72rem;color:{color};">{stability}</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+        st.markdown("<div style='height:1rem'></div>", unsafe_allow_html=True)
+
+        # ── Comparison table ──────────────────────────────────────────────────
+        st.markdown('<span class="section-label">Provider Comparison Table</span>', unsafe_allow_html=True)
+        table_rows = []
+        for idx, (prov, res) in enumerate(ranked):
+            avg_words = (
+                sum(len(v.split()) for v in res.variations) / len(res.variations)
+                if res.variations else 0
+            )
+            table_rows.append({
+                "Rank":     f"#{idx + 1}",
+                "Provider": prov.capitalize(),
+                "PSI Score": round(res.psi_score, 1),
+                "Semantic":  round(res.semantic_similarity, 3),
+                "Keyword":   round(res.keyword_consistency, 3),
+                "Length":    round(res.length_consistency, 3),
+                "Avg Words": round(avg_words, 1),
+                "Stability": _stability_label(res.psi_score),
+            })
+
+        st.dataframe(
+            table_rows,
+            use_container_width=True,
+            column_config={
+                "PSI Score": st.column_config.ProgressColumn(
+                    "PSI Score", min_value=0, max_value=100, format="%.1f"
+                ),
+                "Semantic": st.column_config.NumberColumn(format="%.3f"),
+                "Keyword":  st.column_config.NumberColumn(format="%.3f"),
+                "Length":   st.column_config.NumberColumn(format="%.3f"),
+            },
+            hide_index=True,
+        )
+
+        st.markdown("<div style='height:1rem'></div>", unsafe_allow_html=True)
+
+        # ── Charts ────────────────────────────────────────────────────────────
+        st.markdown('<span class="section-label">Visual Comparison</span>', unsafe_allow_html=True)
+        ch1, ch2 = st.columns(2)
+
+        provider_labels = [p.capitalize() for p, _ in ranked]
+        psi_values      = [r.psi_score for _, r in ranked]
+        bar_colors_psi  = [
+            "#3fb950" if v >= 75 else ("#d29922" if v >= 50 else "#f85149")
+            for v in psi_values
+        ]
+
+        with ch1:
+            fig_psi = go.Figure(go.Bar(
+                x=provider_labels,
+                y=psi_values,
+                marker_color=bar_colors_psi,
+                marker_line_color="rgba(0,0,0,0)",
+                text=[f"{v:.1f}" for v in psi_values],
+                textposition="outside",
+                textfont=dict(family="JetBrains Mono", size=11, color="#8b949e"),
+            ))
+            fig_psi.update_layout(
+                title=dict(text="PSI Score by Provider", font=dict(size=12, color="#8b949e")),
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="#0d1117",
+                font=dict(color="#8b949e", family="Inter"),
+                yaxis=dict(range=[0, 115], gridcolor="#1c2128",
+                           tickfont=dict(size=10), title="PSI Score",
+                           titlefont=dict(size=11, color="#484f58")),
+                xaxis=dict(gridcolor="#1c2128", tickfont=dict(size=11, color="#cdd9e5")),
+                margin=dict(l=10, r=10, t=35, b=10),
+                height=280,
+            )
+            st.plotly_chart(fig_psi, use_container_width=True)
+
+        with ch2:
+            avg_words_list = []
+            for _, res in ranked:
+                avg_words_list.append(
+                    sum(len(v.split()) for v in res.variations) / len(res.variations)
+                    if res.variations else 0
+                )
+            fig_words = go.Figure(go.Bar(
+                x=provider_labels,
+                y=avg_words_list,
+                marker_color="#1f3a6b",
+                marker_line_color="#2979ff",
+                marker_line_width=1,
+                text=[f"{w:.0f}" for w in avg_words_list],
+                textposition="outside",
+                textfont=dict(family="JetBrains Mono", size=11, color="#8b949e"),
+            ))
+            fig_words.update_layout(
+                title=dict(text="Avg Response Length (words)", font=dict(size=12, color="#8b949e")),
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="#0d1117",
+                font=dict(color="#8b949e", family="Inter"),
+                yaxis=dict(gridcolor="#1c2128", tickfont=dict(size=10),
+                           title="Avg Words", titlefont=dict(size=11, color="#484f58")),
+                xaxis=dict(gridcolor="#1c2128", tickfont=dict(size=11, color="#cdd9e5")),
+                margin=dict(l=10, r=10, t=35, b=10),
+                height=280,
+            )
+            st.plotly_chart(fig_words, use_container_width=True)
+
+        # ── PSI component breakdown chart ─────────────────────────────────────
+        st.markdown('<span class="section-label">PSI Component Breakdown</span>', unsafe_allow_html=True)
+        fig_comp = go.Figure()
+        comp_defs = [
+            ("Semantic Similarity", [r.semantic_similarity for _, r in ranked], "#1f3a6b", "#2979ff"),
+            ("Keyword Consistency", [r.keyword_consistency for _, r in ranked], "#1a3a1a", "#3fb950"),
+            ("Length Consistency",  [r.length_consistency  for _, r in ranked], "#3d2a05", "#d29922"),
+        ]
+        for comp_name, vals, fill, line in comp_defs:
+            fig_comp.add_trace(go.Bar(
+                name=comp_name,
+                x=provider_labels,
+                y=vals,
+                marker_color=fill,
+                marker_line_color=line,
+                marker_line_width=1,
+                text=[f"{v:.3f}" for v in vals],
+                textposition="outside",
+                textfont=dict(family="JetBrains Mono", size=9, color="#8b949e"),
+            ))
+        fig_comp.update_layout(
+            barmode="group",
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="#0d1117",
+            font=dict(color="#8b949e", family="Inter"),
+            yaxis=dict(range=[0, 1.25], gridcolor="#1c2128", tickfont=dict(size=10),
+                       title="Score (0–1)", titlefont=dict(size=11, color="#484f58")),
+            xaxis=dict(gridcolor="#1c2128", tickfont=dict(size=11, color="#cdd9e5")),
+            legend=dict(bgcolor="rgba(0,0,0,0)", font=dict(size=11, color="#8b949e")),
+            margin=dict(l=10, r=10, t=10, b=10),
+            height=280,
+        )
+        st.plotly_chart(fig_comp, use_container_width=True)
+
+        # ── All compared prompts (when ≥2 multi-runs exist) ───────────────────
+        if len(multi_runs) >= 2:
+            st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
+            st.markdown('<span class="section-label">All Compared Prompts</span>', unsafe_allow_html=True)
+            hist_rows = []
+            for mr in multi_runs:
+                mr_ranked = sorted(mr.results.items(), key=lambda kv: kv[1].psi_score, reverse=True)
+                best_prov, best_res = mr_ranked[0]
+                hist_rows.append({
+                    "Prompt":     mr.prompt[:60] + ("…" if len(mr.prompt) > 60 else ""),
+                    "Category":   mr.category,
+                    "Best Model": best_prov.capitalize(),
+                    "Best PSI":   round(best_res.psi_score, 1),
+                    **{p.capitalize() + " PSI": round(r.psi_score, 1) for p, r in mr_ranked},
+                })
+            hist_rows.sort(key=lambda x: x["Best PSI"], reverse=True)
+            st.dataframe(hist_rows, use_container_width=True, hide_index=True)
+
+        # ── PHASE 7 — Export Section ──────────────────────────────────────────
+        st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
+        st.markdown("---")
+        st.markdown('<span class="section-label">Export Results</span>', unsafe_allow_html=True)
+
+        # ── Build export payloads ────────────────────────────────────────────
+
+        # 1. CSV — comparison table for the active multi run
+        def _build_csv(mr: MultiProviderResult) -> str:
+            buf = io.StringIO()
+            writer = csv.writer(buf)
+            writer.writerow(["Rank", "Provider", "PSI Score", "Semantic Similarity",
+                             "Keyword Consistency", "Length Consistency",
+                             "Avg Response Words", "Stability", "Prompt", "Category"])
+            _ranked = sorted(mr.results.items(), key=lambda kv: kv[1].psi_score, reverse=True)
+            for rank_idx, (prov, res) in enumerate(_ranked):
+                avg_w = (
+                    sum(len(v.split()) for v in res.variations) / len(res.variations)
+                    if res.variations else 0
+                )
+                writer.writerow([
+                    rank_idx + 1,
+                    prov.capitalize(),
+                    round(res.psi_score, 2),
+                    round(res.semantic_similarity, 4),
+                    round(res.keyword_consistency, 4),
+                    round(res.length_consistency, 4),
+                    round(avg_w, 1),
+                    _stability_label(res.psi_score),
+                    mr.prompt,
+                    mr.category,
+                ])
+            return buf.getvalue()
+
+        # 2. JSON — full structured results
+        def _build_json(mr: MultiProviderResult) -> str:
+            _ranked = sorted(mr.results.items(), key=lambda kv: kv[1].psi_score, reverse=True)
+            payload = {
+                "prompt":    mr.prompt,
+                "category":  mr.category,
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+                "results": {
+                    prov: {
+                        "psi_score":           round(res.psi_score, 4),
+                        "semantic_similarity":  round(res.semantic_similarity, 4),
+                        "keyword_consistency":  round(res.keyword_consistency, 4),
+                        "length_consistency":   round(res.length_consistency, 4),
+                        "stability":            _stability_label(res.psi_score),
+                        "num_variations":       len(res.variations),
+                        "response_length_avg_words": round(
+                            sum(len(v.split()) for v in res.variations) / len(res.variations)
+                            if res.variations else 0, 1
+                        ),
+                    }
+                    for prov, res in mr.results.items()
+                },
+                "ranking": [
+                    {"rank": i + 1, "provider": prov, "psi_score": round(res.psi_score, 4)}
+                    for i, (prov, res) in enumerate(_ranked)
+                ],
+            }
+            return json.dumps(payload, indent=2)
+
+        # 3. TXT — human-readable ranking report
+        def _build_txt(mr: MultiProviderResult) -> str:
+            _ranked = sorted(mr.results.items(), key=lambda kv: kv[1].psi_score, reverse=True)
+            lines = [
+                "=" * 52,
+                "  PSAF Comparison Report",
+                "  Prompt Stability Analysis Framework",
+                "=" * 52,
+                "",
+                f"Prompt   : {mr.prompt}",
+                f"Category : {mr.category}",
+                f"Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC",
+                "",
+                "-" * 52,
+                "Ranking",
+                "-" * 52,
+            ]
+            medals = ["🥇 Best Model", "🥈 Second", "🥉 Third"]
+            for i, (prov, res) in enumerate(_ranked):
+                label = medals[i] if i < len(medals) else f"#{i+1}"
+                lines.append(f"  {label}: {prov.capitalize()}")
+            lines += ["", "-" * 52, "Scores", "-" * 52]
+            for prov, res in _ranked:
+                lines.append(f"  {prov.capitalize():<12} PSI: {res.psi_score:6.2f}  "
+                             f"({_stability_label(res.psi_score)})")
+            lines += ["", "-" * 52, "Component Detail", "-" * 52]
+            for prov, res in _ranked:
+                lines.append(f"  {prov.capitalize()}")
+                lines.append(f"    Semantic Similarity : {res.semantic_similarity:.4f}  (weight 50%)")
+                lines.append(f"    Keyword Consistency : {res.keyword_consistency:.4f}  (weight 30%)")
+                lines.append(f"    Length Consistency  : {res.length_consistency:.4f}  (weight 20%)")
+            lines += ["", "=" * 52, "  End of Report", "=" * 52, ""]
+            return "\n".join(lines)
+
+        # ── Render three download buttons ────────────────────────────────────
+        csv_data  = _build_csv(active)
+        json_data = _build_json(active)
+        txt_data  = _build_txt(active)
+
+        ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        exp_c1, exp_c2, exp_c3 = st.columns(3)
+
+        with exp_c1:
+            st.download_button(
+                label="⬇  Download CSV",
+                data=csv_data,
+                file_name=f"psaf_comparison_{ts}.csv",
+                mime="text/csv",
+                use_container_width=True,
+                help="Comparison table with PSI scores, components, and ranking.",
+            )
+
+        with exp_c2:
+            st.download_button(
+                label="⬇  Download JSON",
+                data=json_data,
+                file_name=f"psaf_comparison_{ts}.json",
+                mime="application/json",
+                use_container_width=True,
+                help="Full structured results including all PSI components and ranking.",
+            )
+
+        with exp_c3:
+            st.download_button(
+                label="⬇  Download Report (TXT)",
+                data=txt_data,
+                file_name=f"psaf_report_{ts}.txt",
+                mime="text/plain",
+                use_container_width=True,
+                help="Human-readable ranking report with scores and stability labels.",
+            )
+
+        st.markdown(
+            "<div style='font-size:0.72rem;color:#484f58;margin-top:0.4rem;'>"
+            "Exports reflect the most recent All Models run shown above. "
+            "Re-run an experiment to refresh.</div>",
+            unsafe_allow_html=True,
+        )

@@ -14,11 +14,7 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 # NEVER hardcode your key. Set it in your shell:
 #   export GROQ_API_KEY="gsk_..."
 # Or in a .env file (add .env to .gitignore — NEVER commit it).
-try:
-    import streamlit as st
-    GROQ_API_KEY = st.secrets.get("GROQ_API_KEY", os.getenv("GROQ_API_KEY", ""))
-except Exception:
-    GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
 
 # LLM settings
 LLM_MODEL          = "llama-3.1-8b-instant"

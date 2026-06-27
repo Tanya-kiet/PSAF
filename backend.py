@@ -28,6 +28,7 @@ from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
 from sklearn.metrics.pairwise import cosine_similarity
 
 import config
+from providers import get_provider
 
 logger = logging.getLogger(__name__)
 
@@ -106,33 +107,78 @@ def _call_groq(client: Groq, messages: list[dict], temperature: float = 0.7) -> 
 # ── Variation generation ──────────────────────────────────────────────────────
 
 _VARIATION_SYSTEM = (
-    "You are a prompt rewriting expert. "
-    "Rewrite the given question in different ways while preserving its exact meaning. "
-    "Each rewrite must differ in wording and structure but ask the same thing. "
-    "Return ONLY a valid JSON array of strings — no markdown, no explanation."
+    "You are an expert at rewriting questions in diverse ways. "
+    "Given a question, produce EXACTLY the requested number of paraphrases. "
+    "RULES — every paraphrase MUST:\n"
+    "  1. Preserve the original meaning completely.\n"
+    "  2. Use DIFFERENT sentence structure from the original and from each other.\n"
+    "  3. Use DIFFERENT vocabulary where possible (synonyms, alternative phrasings).\n"
+    "  4. NOT simply swap one or two words — substantially reword each version.\n"
+    "  5. NOT repeat the original question verbatim.\n"
+    "Output ONLY a valid JSON array of strings, with no markdown fences, "
+    "no numbering, no extra text, and no explanation."
 )
+
+# Safe non-empty fallback so compute_psi never sees an empty response
+_FALLBACK_RESPONSE = "[No response — provider call failed]"
 
 
 def generate_variations(client: Groq, seed: str, n: int = config.MAX_VARIATIONS) -> list[str]:
-    """Generate up to `n` paraphrases of `seed` using one Groq call."""
-    user_msg = f"Rewrite this question in {n} different ways:\n\n{seed}"
+    """Generate up to `n` paraphrases of `seed` using one Groq call.
+
+    Legacy entry-point used by experiments.py.  Now uses the stronger
+    variation prompt and includes the diversity safety check.
+    """
+    n_request = n + 2
+    user_msg = (
+        f"Rewrite the following question in EXACTLY {n_request} different ways. "
+        f"Each version must use a noticeably different sentence structure and vocabulary.\n\n"
+        f"Question: {seed}\n\n"
+        f"Return ONLY a JSON array of {n_request} strings."
+    )
     raw = _call_groq(
         client,
         [{"role": "system", "content": _VARIATION_SYSTEM},
          {"role": "user", "content": user_msg}],
         temperature=config.PARAPHRASE_TEMPERATURE,
     )
+
+    logger.debug("generate_variations (legacy) raw reply: %r", raw[:300])
+
+    variations: list[str] = []
     try:
-        cleaned = re.sub(r"```(?:json)?|```", "", raw).strip()
+        cleaned = re.sub(r"```(?:json)?", "", raw).replace("```", "").strip()
+        array_match = re.search(r"\[.*\]", cleaned, re.DOTALL)
+        if array_match:
+            cleaned = array_match.group(0)
         parsed = json.loads(cleaned)
         if isinstance(parsed, list):
-            variations = [str(v) for v in parsed if str(v).strip()][:n]
-            if len(variations) < n:
-                variations += [seed] * (n - len(variations))
-            return variations
-    except Exception:
-        pass
-    return [seed] * n
+            variations = [str(v).strip() for v in parsed if str(v).strip()]
+    except Exception as exc:
+        logger.warning("generate_variations: JSON parse failed (%s)", exc)
+
+    # Filter out copies of the seed
+    unique = [v for v in variations if v.strip().lower() != seed.strip().lower()]
+    if not unique:
+        logger.warning("generate_variations: no diverse variations produced; using seed copies.")
+        unique = variations or [seed]
+
+    # Deduplicate
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for v in unique:
+        k = v.strip().lower()
+        if k not in seen:
+            seen.add(k)
+            deduped.append(v)
+
+    result = deduped[:n]
+    if len(result) < n:
+        result += [seed] * (n - len(result))
+
+    logger.debug("generate_variations: returning %d variations, %d unique",
+                 len(result), len({v.lower() for v in result}))
+    return result
 
 
 # ── PSI computation ───────────────────────────────────────────────────────────
@@ -153,8 +199,20 @@ def compute_psi(responses: list[str]) -> tuple[float, float, float, float, list[
     Returns (psi, S, K, L, similarity_matrix).
     All components in [0,1] except psi which is in [0,100].
     """
-    valid = [r for r in responses if r.strip()]
+    # Replace empty strings with the fallback token so they survive the valid filter
+    sanitised = [r if r.strip() else _FALLBACK_RESPONSE for r in responses]
+    valid = [r for r in sanitised if r.strip()]
+
+    # ── Debug logging ──────────────────────────────────────────────────────────
+    logger.debug("compute_psi: %d responses passed in, %d non-empty", len(responses), len(valid))
+    for i, r in enumerate(valid):
+        logger.debug("  response[%d] (%d words): %r…", i, len(r.split()), r[:80])
+
     if len(valid) < 2:
+        logger.warning(
+            "compute_psi: fewer than 2 valid responses (%d) — returning 0.0. "
+            "Check that the LLM is actually returning text.", len(valid)
+        )
         n = max(len(valid), 1)
         return 0.0, 0.0, 0.0, 0.0, [[1.0] * n] * n
 
@@ -162,8 +220,14 @@ def compute_psi(responses: list[str]) -> tuple[float, float, float, float, list[
     embs = model.encode(valid, show_progress_bar=False)
     sim_matrix = cosine_similarity(embs)
 
+    # ── Debug: print similarity matrix ────────────────────────────────────────
+    logger.debug("compute_psi: embedding shape = %s", embs.shape)
+    logger.debug("compute_psi: similarity matrix =\n%s",
+                 "\n".join("  " + " ".join(f"{v:.3f}" for v in row) for row in sim_matrix))
+
     idx = np.triu_indices_from(sim_matrix, k=1)
-    S = float(np.clip(np.mean(sim_matrix[idx]), 0, 1))
+    _vals = sim_matrix[idx]
+    S = float(np.clip(np.mean(_vals), 0, 1)) if _vals.size > 0 else 1.0
 
     sets = [_keywords(r) for r in valid]
     K_scores = []
@@ -184,13 +248,16 @@ def compute_psi(responses: list[str]) -> tuple[float, float, float, float, list[
         0, 100,
     ))
 
+    logger.debug("compute_psi: S=%.4f  K=%.4f  L=%.4f  PSI=%.2f", S, K, L, psi)
+
     return psi, S, K, L, sim_matrix.tolist()
 
 
 # ── Cache helpers ─────────────────────────────────────────────────────────────
 
-def _cache_key(category: str, prompt: str, n_variations: int) -> str:
-    raw = f"{category}|{prompt}|{n_variations}|{config.LLM_MODEL}"
+def _cache_key(category: str, prompt: str, n_variations: int, provider_name: str = "groq") -> str:
+    # Include provider_name so Groq and OpenAI results never share a cache entry
+    raw = f"{category}|{prompt}|{n_variations}|{config.LLM_MODEL}|{provider_name}"
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
@@ -202,7 +269,22 @@ def _load_cache(key: str) -> Optional[dict]:
     p = _cache_path(key)
     if p.exists():
         try:
-            return json.loads(p.read_text())
+            data = json.loads(p.read_text())
+            # ── Stale-cache guard ─────────────────────────────────────────────
+            # Old runs with broken variation generation stored PSI=0.0 with
+            # all-identical variation texts.  Detect and evict those entries so
+            # they don't replay incorrect results after the fix.
+            variations = data.get("variations", [])
+            if variations:
+                var_texts = {str(v.get("variation", "")).strip().lower() for v in variations}
+                if len(var_texts) <= 1 and data.get("psi_score", -1) == 0.0:
+                    logger.warning(
+                        "_load_cache: evicting stale zero-PSI cache entry %s "
+                        "(all-identical variations detected).", key
+                    )
+                    p.unlink(missing_ok=True)
+                    return None
+            return data
         except Exception:
             pass
     return None
@@ -220,19 +302,30 @@ def run_experiment(
     n_variations: int = config.MAX_VARIATIONS,
     force_rerun: bool = False,
     progress_cb: Optional[Callable[[str], None]] = None,
+    provider_name: str = "groq",
 ) -> QuestionResult:
     """
-    Run a single question experiment.
+    Run a single question experiment using the specified LLM provider.
 
     Uses disk cache unless `force_rerun=True`.
     Calls `progress_cb(message)` at each stage if provided.
+
+    Args:
+        category:      Prompt category label.
+        prompt:        The seed prompt to evaluate.
+        n_variations:  Number of paraphrases to generate (default from config).
+        force_rerun:   Bypass cache and re-run all LLM calls when True.
+        progress_cb:   Optional callback for progress messages.
+        provider_name: LLM backend to use — "groq" (default) or "openai".
+                       Defaults to "groq" so all existing call-sites that
+                       omit this argument behave exactly as before.
     """
     def emit(msg: str):
         if progress_cb:
             progress_cb(msg)
         logger.info(msg)
 
-    cache_key = _cache_key(category, prompt, n_variations)
+    cache_key = _cache_key(category, prompt, n_variations, provider_name)
 
     # ── Cache hit ─────────────────────────────────────────────────────────────
     if not force_rerun:
@@ -243,13 +336,30 @@ def run_experiment(
             qr.variations = [VariationResult(**v) for v in cached["variations"]]
             return qr
 
-    # ── Cache miss: call Groq ─────────────────────────────────────────────────
-    client = _groq_client()
-    groq_calls = 0
+    # ── Cache miss: call LLM via provider ────────────────────────────────────
+    provider = get_provider(provider_name)
+    llm_calls = 0
 
     emit(f"🔀 Generating {n_variations} variations…")
-    variations = generate_variations(client, prompt, n_variations)
-    groq_calls += 1
+    variations = provider.generate_variations(prompt)[:n_variations]
+    # Pad to requested count if provider returned fewer
+    if len(variations) < n_variations:
+        variations += [prompt] * (n_variations - len(variations))
+    llm_calls += 1
+
+    # ── Debug: log what was actually generated ────────────────────────────────
+    logger.debug("run_experiment: %d variations for prompt %r", len(variations), prompt[:60])
+    for i, v in enumerate(variations):
+        logger.debug("  var[%d]: %r", i, v[:100])
+    n_unique = len({v.strip().lower() for v in variations})
+    if n_unique == 1:
+        logger.warning(
+            "run_experiment: ALL %d variations are identical — "
+            "PSI will be artificially high (all-same responses). "
+            "Check generate_variations() and the GROQ_API_KEY.", len(variations)
+        )
+    logger.debug("run_experiment: %d unique variations out of %d", n_unique, len(variations))
+
     time.sleep(0.3)  # brief pause to avoid rate-limit burst
 
     all_prompts = [prompt] + variations  # original + paraphrases
@@ -257,9 +367,15 @@ def run_experiment(
 
     for i, var in enumerate(all_prompts):
         emit(f"🤖 Getting LLM response {i + 1}/{len(all_prompts)}…")
-        resp = _call_groq(client, [{"role": "user", "content": var}])
+        resp = provider.generate_response(var)
+        # Safety: never let an empty string into the PSI pipeline
+        if not resp.strip():
+            logger.warning(
+                "run_experiment: empty response for prompt[%d] %r — using fallback.", i, var[:60]
+            )
+            resp = _FALLBACK_RESPONSE
         responses.append(resp)
-        groq_calls += 1
+        llm_calls += 1
         if i < len(all_prompts) - 1:
             time.sleep(0.5)  # rate-limit breathing room
 
@@ -287,7 +403,7 @@ def run_experiment(
     # serialise for cache
     data = asdict(result)
     _save_cache(cache_key, data)
-    emit(f"💾 Result cached ({groq_calls} Groq calls made)")
+    emit(f"💾 Result cached ({llm_calls} LLM calls made via {provider_name})")
 
     return result
 
@@ -297,14 +413,26 @@ def run_category_experiment(
     n_variations: int = config.MAX_VARIATIONS,
     force_rerun: bool = False,
     progress_cb: Optional[Callable[[str], None]] = None,
+    provider_name: str = "groq",
 ) -> list[QuestionResult]:
-    """Run all questions in a category."""
+    """
+    Run all questions in a category using the specified LLM provider.
+
+    Args:
+        category:      Prompt category to evaluate.
+        n_variations:  Number of paraphrases per prompt.
+        force_rerun:   Bypass cache when True.
+        progress_cb:   Optional progress callback.
+        provider_name: LLM backend — "groq" (default) or "openai".
+    """
     prompts = config.PROMPT_CATEGORIES.get(category, [])
     results = []
     for i, prompt in enumerate(prompts):
         if progress_cb:
             progress_cb(f"Question {i+1}/{len(prompts)}: {prompt[:50]}…")
-        result = run_experiment(category, prompt, n_variations, force_rerun, progress_cb)
+        result = run_experiment(
+            category, prompt, n_variations, force_rerun, progress_cb, provider_name
+        )
         results.append(result)
     return results
 
@@ -330,3 +458,96 @@ def compute_category_stats(results: list[QuestionResult]) -> dict[str, dict]:
         stats[cat]["rank"] = rank
 
     return stats
+
+
+# ── Multi-provider result container ───────────────────────────────────────────
+
+@dataclass
+class MultiProviderResult:
+    """
+    Holds the outcome of an "all models" run for a single prompt.
+
+    Structure mirrors the requirement:
+        {
+          "prompt": "...",
+          "results": {
+            "groq":   QuestionResult,
+            "openai": QuestionResult,
+          }
+        }
+
+    Single-provider QuestionResult objects are stored verbatim under
+    their provider key — no PSI values are merged or averaged.
+    """
+    prompt: str
+    category: str
+    results: dict[str, QuestionResult]   # provider_name → QuestionResult
+
+    def to_dict(self) -> dict:
+        return {
+            "prompt": self.prompt,
+            "category": self.category,
+            "results": {k: asdict(v) for k, v in self.results.items()},
+        }
+
+
+# ── All-providers experiment runner ──────────────────────────────────────────
+
+def run_all_providers(
+    category: str,
+    prompt: str,
+    n_variations: int = config.MAX_VARIATIONS,
+    force_rerun: bool = False,
+    progress_cb: Optional[Callable[[str], None]] = None,
+) -> MultiProviderResult:
+    """
+    Run the same experiment sequentially across every registered provider.
+
+    Each provider gets its own independent call to run_experiment(), so:
+      • PSI is computed separately per provider (never merged).
+      • Cache keys are provider-scoped (no cross-contamination).
+      • Single-provider run_experiment() is reused unchanged.
+
+    Args:
+        category:     Prompt category label.
+        prompt:       The seed prompt to evaluate.
+        n_variations: Paraphrase count (passed through to each provider).
+        force_rerun:  Bypass cache for all providers when True.
+        progress_cb:  Optional progress callback (prefixed with provider name).
+
+    Returns:
+        MultiProviderResult containing one QuestionResult per provider.
+    """
+    from providers import PROVIDER_REGISTRY   # import here to avoid circular at module load
+
+    # Groq-first ordering: run the fast baseline provider before slower ones
+    # (e.g. Gemini) so the UI receives early feedback quickly.
+    ordered = ["groq"] + [p for p in PROVIDER_REGISTRY if p != "groq"]
+
+    provider_results: dict[str, QuestionResult] = {}
+
+    for provider_name in ordered:
+        def _scoped_cb(msg: str, pname: str = provider_name) -> None:
+            if progress_cb:
+                progress_cb(f"[{pname.upper()}] {msg}")
+
+        logger.info("run_all_providers — starting provider: %s", provider_name)
+        qr = run_experiment(
+            category=category,
+            prompt=prompt,
+            n_variations=n_variations,
+            force_rerun=force_rerun,
+            progress_cb=_scoped_cb,
+            provider_name=provider_name,
+        )
+        provider_results[provider_name] = qr
+        logger.info(
+            "run_all_providers — %s complete | PSI=%.2f",
+            provider_name, qr.psi_score,
+        )
+
+    return MultiProviderResult(
+        prompt=prompt,
+        category=category,
+        results=provider_results,
+    )

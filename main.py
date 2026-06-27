@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import csv
 import logging
+import os
 import sys
 import time
 from pathlib import Path
@@ -24,6 +25,7 @@ from groq import Groq
 
 import config
 import psi
+from providers import get_provider
 from llm_interface import LLMInterface, ResponseRecord
 from prompt_generator import (
     PromptCategoryManager,
@@ -123,22 +125,28 @@ def _print_summary(
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
-def main() -> None:
+def main(provider_name: str = "groq") -> None:
     _setup_logging()
-    logger.info("PSAF starting …")
+    logger.info("PSAF starting … (provider: %s)", provider_name)
 
-    # ── Validate API key ──────────────────────────────────────────────────────
-    if not config.GROQ_API_KEY:
+    # ── Validate API key for selected provider ────────────────────────────────
+    if provider_name == "groq" and not config.GROQ_API_KEY:
         logger.error(
-            "ANTHROPIC_API_KEY environment variable is not set. "
-            "Export it before running: export ANTHROPIC_API_KEY=sk-..."
+            "GROQ_API_KEY environment variable is not set. "
+            "Export it before running: export GROQ_API_KEY=gsk_..."
+        )
+        sys.exit(1)
+    if provider_name == "openai" and not os.getenv("OPENAI_API_KEY", ""):
+        logger.error(
+            "OPENAI_API_KEY environment variable is not set. "
+            "Export it before running: export OPENAI_API_KEY='sk-...'\n"
+            "For Streamlit, add it to .streamlit/secrets.toml instead."
         )
         sys.exit(1)
 
-    # ── Initialise Anthropic client ───────────────────────────────────────────
-    client = Groq(
-    api_key=config.GROQ_API_KEY
-)
+    # ── Initialise LLM provider ───────────────────────────────────────────────
+    provider = get_provider(provider_name)
+    client = provider._client
 
     # ── Step 1: Load categories ───────────────────────────────────────────────
     logger.info("Step 1/5 — Loading prompt categories …")
@@ -182,4 +190,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    # Optional: python main.py openai
+    _provider = sys.argv[1] if len(sys.argv) > 1 else "groq"
+    main(provider_name=_provider)

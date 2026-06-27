@@ -212,7 +212,9 @@ def _pairwise_mean(values_matrix: np.ndarray) -> float:
     if n < 2:
         return 1.0  # a single response is trivially "consistent" with itself
     iu = np.triu_indices(n, k=1)
-    return float(np.mean(values_matrix[iu]))
+    vals = values_matrix[iu]
+    # Guard: empty slice (e.g. n==1 reaches here in edge cases) → safe default
+    return float(np.mean(vals)) if vals.size > 0 else 1.0
 
 
 def compute_semantic_similarity(responses: list[str]) -> float:
